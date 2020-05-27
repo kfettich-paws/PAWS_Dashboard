@@ -1,0 +1,186 @@
+---
+title: "WFH Trends at PAWS"
+author: "Karla Fettich"
+date: "May 27, 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+```
+
+## Dataset description
+
+```{r, echo = FALSE}
+
+df <- read.csv('WFHReport.csv')
+colnames(df) <- c("Timestamp", "Name", "ShiftName", "Date",
+                  "TimeStart", "TimeEnd", "VMLogged", "VMCallback",
+                  "EmailsReplied", "FavMoment", "Email")
+df$Date <- as.Date(as.character(df$Date), format = "%m/%d/%Y")
+df$Name <- as.character(df$Name)
+df$ShiftName <- as.character(df$ShiftName)
+```
+
+The dataset consists of `r nrow(df)` entries each describing a shift between `r min(df$Date)` and `r max(df$Date)`. The following charcateristics are used in the dataset to describe a shift: 
+
+- **Timestamp**: the timestamp when the record was created via google sheets, 
+- **Name**: the name of the person working the shift
+- **ShiftName**: the name of the shift
+- **Date**: the date when the shift was worked
+- **TimeStart**: time when person started working
+- **TimeEnd**: time when person stopped working
+- **VMLogged**: number of voicemails logged during shift
+- **VMCallback**: number of voicemails called back during shift
+- **EmailsReplied**: number of emails replied to during shift
+- **FavMoment**: favorite moment of the shift
+- **Email**: Email address of person
+
+There are `r length(unique(df$Name))` people who have records of shifts:
+
+```{r, echo = FALSE}
+knitr::kable(df %>% 
+               group_by(Name) %>%
+               summarize(Shifts = n()) %>%
+               arrange(desc(Shifts)))
+```
+
+There are `r length(unique(df$ShiftName))` shifts: 
+
+```{r, echo = FALSE}
+knitr::kable(df %>% 
+               group_by(ShiftName) %>%
+               summarize(Shifts = n()) %>%
+               arrange(desc(Shifts)))
+```
+
+```{r, echo = FALSE}
+alldays <- seq(min(df$Date),max(df$Date), by = "1 day")
+missingDates <- alldays[which(!alldays %in% df$Date)]
+```
+
+The following dates did not have any record of activity: `r paste0(missingDates, collapse = ", ")`
+
+## Trends in WFH volume
+
+```{r, echo = FALSE}
+df$HoursWorked <- difftime(as.POSIXlt(paste(df$Date, df$TimeEnd), format = "%Y-%m-%d %r"), 
+                           as.POSIXlt(paste(df$Date, df$TimeStart), format = "%Y-%m-%d %r"), 
+                           units = "mins")
+```
+
+We will define volume as VMLogged, VMCallback and EmailsReplied, as well as a new variable called HoursWorked, which is a calculation of the time elapsed between TimeStart and TimeEnd. There were multiple entries where TimeEnd was before TimeStart:
+
+```{r, echo = FALSE}
+knitr::kable(df[df$HoursWorked<0 & !is.na(df$Name),
+                c("Timestamp", "Name","Date","TimeStart", "TimeEnd")])
+```
+
+Given the timestamp at which these records were enterd, I will assume that AM is actually PM for these entries. 
+
+```{r, echo = FALSE}
+df$TimeEnd <- as.POSIXlt(paste(df$Date, df$TimeEnd), format = "%Y-%m-%d %r")
+df$TimeStart <- as.POSIXlt(paste(df$Date, df$TimeStart), format = "%Y-%m-%d %r")
+df$TimeEnd[df$HoursWorked<0] <- df$TimeEnd[df$HoursWorked<0] + 12*60*60
+
+df$HoursWorked <- difftime(df$TimeEnd, df$TimeStart, units = "mins")
+```
+
+## Daily Trends
+
+```{r, echo = FALSE, include = FALSE}
+daily <- df %>%
+  group_by(Date) %>% 
+  summarise(VMLogged = sum(VMLogged),
+            VMCallback = sum(VMCallback),
+            EmailsReplied = sum(EmailsReplied),
+            HoursWorked = round(sum(HoursWorked)/60, digits = 2))
+daily$weekLabels <- cut(as.Date(daily$Date), "week")
+weekLabels <- as.Date(as.character(unique(daily$weekLabels)), format = "%m/%d%/Y")
+
+library(ggplot2)
+library(lubridate)
+library(gridExtra)
+
+p1 <- ggplot(daily, aes(x=Date, y=as.numeric(HoursWorked))) +
+  geom_line() + 
+  xlab("Week") +
+  ylab("Hours Worked") +
+  ggtitle("Hours Worked by Day") +
+  scale_x_date(date_breaks = "1 week", date_labels = "%b %d") +
+  theme(axis.text.x=element_text(angle=60, hjust=1)) 
+
+p2 <- ggplot(daily, aes(x=Date, y=as.numeric(VMLogged))) +
+  geom_line() + 
+  xlab("Week") +
+  ylab("VMLogged") +
+  ggtitle("VMLogged by Day") +
+  scale_x_date(date_breaks = "1 week", date_labels = "%b %d") +
+  theme(axis.text.x=element_text(angle=60, hjust=1)) 
+
+p3 <- ggplot(daily, aes(x=Date, y=as.numeric(VMCallback))) +
+  geom_line() + 
+  xlab("Week") +
+  ylab("VMCallback") +
+  ggtitle("VMCallback by Day") +
+  scale_x_date(date_breaks = "1 week", date_labels = "%b %d") +
+  theme(axis.text.x=element_text(angle=60, hjust=1)) 
+
+p4 <- ggplot(daily, aes(x=Date, y=as.numeric(EmailsReplied))) +
+  geom_line() + 
+  xlab("Week") +
+  ylab("EmailsReplied") +
+  ggtitle("EmailsReplied by Day") +
+  scale_x_date(date_breaks = "1 week", date_labels = "%b %d") +
+  theme(axis.text.x=element_text(angle=60, hjust=1)) 
+```
+
+```{r, echo = FALSE}
+grid.arrange(p2,p3,p4,p1, ncol = 2)
+```
+
+It looks like daily VMs logged and VMs called back were high in the first week of April, but stabilized after that. In contrast, email replies have not decreased dramatically since the first week of April, and neither have the number of hours worked per day. 
+
+```{r, echo = FALSE}
+weekly <- daily %>%
+               group_by(weekLabels) %>%
+               summarise(Mean_VMLogged = round(mean(VMLogged),digits=2),
+                         Mean_VMCallback = round(mean(VMCallback),digits=2),
+                         Mean_EmailsReplied = round(mean(EmailsReplied),digits=2),
+                         Mean_HoursWorked = as.numeric(round(mean(HoursWorked), digits=2)))
+knitr::kable(weekly)
+```
+
+The daily averages of voice mails logged, called back, emails replied and hours worked, for each week, have decreased substantially from the first week of April to the week of 5/18: a 77% decrease in VMs logged, an 82% decrease in VMs called back, a 48% decrease in emails replied. Interestingly, despite this decrease in volume, the hours worked only decreased by 41%, suggesting that while the volume of work has decreased, the work itself may have become more time consuming.
+
+```{r, echo = FALSE}
+library(forecast)
+
+for(i in 1:length(missingDates)){
+  daily[nrow(daily)+1,] <- NA
+  daily$Date[nrow(daily)] <- missingDates[i]
+  daily$VMLogged[nrow(daily)] <- 0
+  daily$VMCallback[nrow(daily)] <- 0
+  daily$EmailsReplied[nrow(daily)] <- 0
+  daily$HoursWorked[nrow(daily)] <- 0
+  daily$weekLabels[nrow(daily)] <- cut(as.Date(missingDates[i]), "week")
+}
+daily <- daily[order(daily$Date),]
+daily$MinsWorked <- as.numeric(daily$HoursWorked)*60
+
+daily <- timeSeries::as.ts(daily)
+summary(tslm(MinsWorked ~ VMLogged + VMCallback + EmailsReplied, data = daily))
+
+```
+
+
+
+Does the WFH volume follow trends? times of the month? days of the week? anything to help us predict volume and staff appropriately
+
+
+
+### Volume by type of WFH? does that follow trends?
+
+### Most efficient staff members at WFH? (although difficulty of task is not pictured here)
+
