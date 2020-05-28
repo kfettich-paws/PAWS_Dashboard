@@ -1,13 +1,53 @@
 ---
 title: "WFH Trends at PAWS"
 author: "Karla Fettich"
-date: "May 27, 2020"
-output: html_document
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 library(dplyr)
+library(TTR)
+library(lubridate)
+library(fpp2)
+library(forecast)
+library(dplyr)
+library(gsheet)
+library(ggfortify)
+library(ggplot2)
+library(scales)
+
+funggcast<-function(dn, fcast){ 
+	require(zoo) #needed for the 'as.yearmon()' function
+ 
+	en<-max(time(fcast$mean)) #extract the max date used in the forecast
+ 
+	#Extract Source and Training Data
+	ds<-as.data.frame(window(dn,end=en))
+	names(ds)<-'observed'
+	ds$date<-time(window(dn,end=en))
+ 
+	#Extract the Fitted Values (need to figure out how to grab confidence intervals)
+	dfit<-as.data.frame(fcast$fitted)
+	dfit$date<-as.Date(as.numeric(time(fcast$fitted)))
+	names(dfit)[1]<-'fitted'
+ 
+	ds<-merge(ds,dfit,all.x=T) #Merge fitted values with source and training data
+ 
+	#Exract the Forecast values and confidence intervals
+	dfcastn<-as.data.frame(fcast)
+	dfcastn$date<-row.names(dfcastn)
+	names(dfcastn)<-c('forecast','lo80','hi80','lo95','hi95','date')
+ 
+	pd<-merge(ds,dfcastn,all=T) #final data.frame for use in ggplot
+	return(pd)
+ 
+}
 ```
 
 ## Dataset description
@@ -23,7 +63,7 @@ df$Name <- as.character(df$Name)
 df$ShiftName <- as.character(df$ShiftName)
 ```
 
-The dataset consists of `r nrow(df)` entries each describing a shift between `r min(df$Date)` and `r max(df$Date)`. The following charcateristics are used in the dataset to describe a shift: 
+The dataset consists of `r nrow(df)` entries each describing a shift between `r min(df$Date)` and `r max(df$Date)`. The following variables are used in the dataset to describe a shift: 
 
 - **Timestamp**: the timestamp when the record was created via google sheets, 
 - **Name**: the name of the person working the shift
@@ -152,7 +192,9 @@ weekly <- daily %>%
 knitr::kable(weekly)
 ```
 
-The daily averages of voice mails logged, called back, emails replied and hours worked, for each week, have decreased substantially from the first week of April to the week of 5/18: a 77% decrease in VMs logged, an 82% decrease in VMs called back, a 48% decrease in emails replied. Interestingly, despite this decrease in volume, the hours worked only decreased by 41%, suggesting that while the volume of work has decreased, the work itself may have become more time consuming.
+The daily averages of voice mails logged, called back, emails replied and hours worked, for each week, have decreased substantially from the first week of April to the week of 5/18: a 77% decrease in VMs logged, an 82% decrease in VMs called back, a 48% decrease in emails replied. Interestingly, despite this decrease in volume, the hours worked only decreased by 41%.
+
+Next I want to determine which type of work contributes significantly to the total workload, specifically does an increase in voice mail logging, voice mail callbacks or email replies significantly contribute to an increase in time worked. For this analysis, I convert hours worked to minutes worked, so that I can more easily interpret the contribution of each type of work. A simple linear regression is not appropriate here, since we know there are time effects and the entries are not independent of each other. I therefore fit a linear model with time series components. 
 
 ```{r, echo = FALSE}
 library(forecast)
@@ -169,16 +211,290 @@ for(i in 1:length(missingDates)){
 daily <- daily[order(daily$Date),]
 daily$MinsWorked <- as.numeric(daily$HoursWorked)*60
 
-daily <- timeSeries::as.ts(daily)
-summary(tslm(MinsWorked ~ VMLogged + VMCallback + EmailsReplied, data = daily))
+dailyTS <- timeSeries::as.ts(daily, frequency = 7)
+summary(tslm(MinsWorked ~ VMLogged + VMCallback + EmailsReplied, data = dailyTS))
+
+```
+
+The model tells us that 56% of the time worked data can be explained by number of VMs logged, number of VMs called back and number of emails replied to (the remaining components that contribute to time worked are not known - they could potentially be a result of individual work styles). Among the 3 types of work examined, we can see that Replying to Emails contributes most strongly to the total time worked, with each email response adding an estimated 8 minutes to the total time worked. Logging VMs is also a significant factor, with each VM logged adding an estimated 16 minutes to the total work time. Calling back VMs does not appear to significantly impact time worked. 
+
+Next I will use the data to predict estimated future workload. 
+
+```{r, echo = FALSE}
+
+daily$Week <- isoweek(daily$Date)
+train <- daily[1:(nrow(daily)-14),]
+test <- daily[(nrow(daily)-13):nrow(daily),]
+daily_ts <- ts(train$HoursWorked, 
+              freq=7,
+              start=train$Week[1])
+# autoplot(daily_ts)
+fit <- tbats(daily_ts)
+seasonal <- !is.null(fit$seasonal)
+```
+
+I will test several time series forecast models and pick the one with the lowest MAD (Mean Absolute Deviation) score, which is essentially a numeric representation of how far from truth, on average, the predictions deviate (the lower the score, the closer to truth). I will expect the model to give me a forecast for the following 2 weeks, and I will evaluate the MAD score by first dividing the whole time series into 2: a training set (all data from start to 2 weeks prior to the end of data), and a test set, which will include the last 2 weeks in the dataset. I will use the training data to create the model, and make predictions for the test data, which I can then compare to the true observed value.
+
+```{r, echo = FALSE}
+mad_custom <- function(actual,pred){
+  mad_custom <- sum(abs(actual - pred))/length(actual)
+  return (mad_custom)
+}
+
+ts_models <- data.frame(model = character(),
+                        MAD = numeric(),
+                        avg_forecast = numeric(),
+                        avg_lo80 = numeric(),
+                        avg_hi80 = numeric(),
+                        avg_lo95 = numeric(),
+                        avg_hi95 = numeric(),
+                        stringsAsFactors = F)
 
 ```
 
 
+```{r simple exponential smoothing, echo = FALSE, warning=FALSE, include=FALSE}
+### Simple Exponential Smoothing
 
-Does the WFH volume follow trends? times of the month? days of the week? anything to help us predict volume and staff appropriately
+se_model <- ses(daily_ts, h = 14)
+se_sum <- summary(se_model)
+pd <- funggcast(daily_ts, se_model)
 
 
+pd$observed[(nrow(pd)-13):nrow(pd)] <- test$HoursWorked
+pd$week <- as.numeric(pd$date)
+pd$week[pd$week >= 53] <- pd$week[pd$week >= 53] -52
+pd$week <- pd$week-1
+pd$date <- daily$Date
+
+# summary(se_model)
+# ggplot(data=pd,aes(x=date,y=observed)) + 
+#   geom_line(col='red') + 
+#   geom_line(aes(y=fitted),col='blue') + 
+#   geom_line(aes(y=forecast)) +
+#   geom_ribbon(aes(ymin=lo95,ymax=hi95),alpha=.25) + 
+#   scale_x_date(name='',breaks='1 week',minor_breaks='1 day',labels=date_format("%d-%b-%y"),expand=c(0,0)) + 
+#   scale_y_continuous(name='Units of Y', breaks= seq(0,max(c(test$total, train$total, se_sum$`Hi 95`)),200)) + 
+#   labs(title = paste0("Simple Exponential Smoothing Fit to Simulated Data (MAD = ",
+#                          round(mad_custom(test$MinsWorked, mean(se_sum$`Point Forecast`)), digits = 2),")"),
+#        subtitle = paste0("black=forecast, blue=fitted, red=data, shadow=95% conf. interval"))+
+#   theme(axis.text.x = element_text(angle = 45))
+
+ts_models[nrow(ts_models)+1,] <- NA
+ts_models$model[1] <- "Simple Exponential Smoothing"
+ts_models$MAD[1] <- round(mad_custom(test$HoursWorked, mean(se_sum$`Point Forecast`)), digits = 2)
+ts_models$avg_forecast[1] <- round(mean(se_model$mean), digits = 2)
+ts_models$avg_lo80[1] <- mean(as.data.frame(se_model$lower)[,1])
+ts_models$avg_lo95[1] <- mean(as.data.frame(se_model$lower)[,2])
+ts_models$avg_hi80[1] <- mean(as.data.frame(se_model$upper)[,1])
+ts_models$avg_hi95[1] <- mean(as.data.frame(se_model$upper)[,2])
+
+```
+
+```{r naive forecast, echo = FALSE, warning=FALSE, include=FALSE}
+## Naive Forecast
+
+naive_mod <- naive(daily_ts, h = 14)
+naive_sum <- summary(naive_mod)
+pd <- funggcast(daily_ts, naive_mod)
+
+pd$observed[(nrow(pd)-13):nrow(pd)] <- test$HoursWorked
+pd$week <- as.numeric(pd$date)
+pd$week[pd$week >= 53] <- pd$week[pd$week >= 53] -52
+pd$week <- pd$week-1
+pd$date <- daily$Date
+
+# summary(naive_mod)
+# ggplot(data=pd,aes(x=date,y=observed)) + 
+#   geom_line(col='red') + 
+#   geom_line(aes(y=fitted),col='blue') + 
+#   geom_line(aes(y=forecast)) +
+#   geom_ribbon(aes(ymin=lo95,ymax=hi95),alpha=.25) + 
+#   scale_x_date(name='',breaks='1 week',minor_breaks='1 day',labels=date_format("%d-%b-%y"),expand=c(0,0)) + 
+#   scale_y_continuous(name='Units of Y', breaks= seq(0,max(c(test$total, train$total, naive_sum$`Hi 95`)),200)) + 
+#   labs(title = paste0("Naive Forecast Fit to Simulated Data (MAD = ",
+#                          round(mad_custom(test$MinsWorked, mean(naive_sum$`Point Forecast`)), digits = 2),")"),
+#        subtitle = paste0("black=forecast, blue=fitted, red=data, shadow=95% conf. interval"))+
+#   theme(axis.text.x = element_text(angle = 45))
+
+ts_models[nrow(ts_models)+1,] <- NA
+ts_models$model[nrow(ts_models)] <- "Naive Forecast"
+ts_models$MAD[nrow(ts_models)] <- round(mad_custom(test$HoursWorked, mean(naive_sum$`Point Forecast`)), digits = 2)
+ts_models$avg_forecast[nrow(ts_models)] <- round(mean(naive_mod$mean), digits = 2)
+ts_models$avg_lo80[nrow(ts_models)] <- mean(as.data.frame(naive_mod$lower)[,1])
+ts_models$avg_lo95[nrow(ts_models)] <- mean(as.data.frame(naive_mod$lower)[,2])
+ts_models$avg_hi80[nrow(ts_models)] <- mean(as.data.frame(naive_mod$upper)[,1])
+ts_models$avg_hi95[nrow(ts_models)] <- mean(as.data.frame(naive_mod$upper)[,2])
+
+```
+
+
+```{r holts trend, echo = FALSE, warning=FALSE, include=FALSE}
+
+### Holt's Trend Method
+
+holt_model <- holt(daily_ts, h = 14)
+holt_sum <- summary(holt_model)
+pd <- funggcast(daily_ts, holt_model)
+
+pd$observed[(nrow(pd)-13):nrow(pd)] <- test$HoursWorked
+pd$week <- as.numeric(pd$date)
+pd$week[pd$week >= 53] <- pd$week[pd$week >= 53] -52
+pd$week <- pd$week-1
+pd$date <- daily$Date
+
+# summary(holt_model)
+# ggplot(data=pd,aes(x=date,y=observed)) + 
+#   geom_line(col='red') + 
+#   geom_line(aes(y=fitted),col='blue') + 
+#   geom_line(aes(y=forecast)) +
+#   geom_ribbon(aes(ymin=lo95,ymax=hi95),alpha=.25) + 
+#   scale_x_date(name='',breaks='1 week',minor_breaks='1 day',labels=date_format("%d-%b-%y"),expand=c(0,0)) + 
+#   scale_y_continuous(name='Units of Y', breaks= seq(0,max(c(test$total, train$total, holt_sum$`Hi 95`)),200)) + 
+#   labs(title = paste0("Holt's Trend Method Fit to Simulated Data (MAD = ",
+#                          round(mad_custom(test$HoursWorked, as.numeric(holt_model$mean)), digits = 2),")"),
+#        subtitle = paste0("black=forecast, blue=fitted, red=data, shadow=95% conf. interval"))+
+#   theme(axis.text.x = element_text(angle = 45))
+
+ts_models[nrow(ts_models)+1,] <- NA
+ts_models$model[nrow(ts_models)] <- "Holt's Trend Method"
+ts_models$MAD[nrow(ts_models)] <- round(mad_custom(test$HoursWorked, as.numeric(holt_model$mean)), digits = 2)
+ts_models$avg_forecast[nrow(ts_models)] <- round(mean(holt_model$mean), digits = 2)
+ts_models$avg_lo80[nrow(ts_models)] <- mean(as.data.frame(holt_model$lower)[,1])
+ts_models$avg_lo95[nrow(ts_models)] <- mean(as.data.frame(holt_model$lower)[,2])
+ts_models$avg_hi80[nrow(ts_models)] <- mean(as.data.frame(holt_model$upper)[,1])
+ts_models$avg_hi95[nrow(ts_models)] <- mean(as.data.frame(holt_model$upper)[,2])
+
+```
+
+```{r arima, echo = FALSE, warning=FALSE, include=FALSE}
+### ARIMA
+
+arima_model <- auto.arima(daily_ts)
+arima_sum <- summary(arima_model)
+fore_arima = forecast::forecast(arima_model, h=14)
+df_arima = as.data.frame(fore_arima)
+
+pd <- funggcast(daily_ts, fore_arima)
+
+pd$observed[(nrow(pd)-13):nrow(pd)] <- test$HoursWorked
+pd$week <- as.numeric(pd$date)
+pd$week[pd$week >= 53] <- pd$week[pd$week >= 53] -52
+pd$week <- pd$week-1
+pd$date <- daily$Date
+
+# summary(arima_model)
+# ggplot(data=pd,aes(x=date,y=observed)) + 
+#   geom_line(col='red') + 
+#   geom_line(aes(y=fitted),col='blue') + 
+#   geom_line(aes(y=forecast)) +
+#   geom_ribbon(aes(ymin=lo95,ymax=hi95),alpha=.25) + 
+#   scale_x_date(name='',breaks='1 week',minor_breaks='1 day',labels=date_format("%d-%b-%y"),expand=c(0,0)) + 
+#   scale_y_continuous(name='Units of Y', breaks= seq(0,max(c(test$total, train$total, df_arima$`Hi 95`)),200)) + 
+#   labs(title = paste0("ARIMA Fit to Simulated Data (MAD = ",
+#                          round(mad_custom(test$MinsWorked, df_arima$`Point Forecast`), digits = 2),")"),
+#        subtitle = paste0("black=forecast, blue=fitted, red=data, shadow=95% conf. interval"))+
+#   theme(axis.text.x = element_text(angle = 45))
+
+ts_models[nrow(ts_models)+1,] <- NA
+ts_models$model[nrow(ts_models)] <- "ARIMA"
+ts_models$MAD[nrow(ts_models)] <- round(mad_custom(test$HoursWorked, df_arima$`Point Forecast`), digits = 2)
+ts_models$avg_forecast[nrow(ts_models)] <- round(mean(fore_arima$mean), digits = 2)
+ts_models$avg_lo80[nrow(ts_models)] <- mean(as.data.frame(fore_arima$lower)[,1])
+ts_models$avg_lo95[nrow(ts_models)] <- mean(as.data.frame(fore_arima$lower)[,2])
+ts_models$avg_hi80[nrow(ts_models)] <- mean(as.data.frame(fore_arima$upper)[,1])
+ts_models$avg_hi95[nrow(ts_models)] <- mean(as.data.frame(fore_arima$upper)[,2])
+```
+
+```{r tbats, echo = FALSE, warning=FALSE, include=FALSE}
+### TBATS
+
+model_tbats <- tbats(daily_ts)
+for_tbats <- forecast::forecast(model_tbats, h=14)
+df_tbats = as.data.frame(for_tbats)
+
+pd <- funggcast(daily_ts, for_tbats)
+
+pd$observed[(nrow(pd)-13):nrow(pd)] <- test$HoursWorked
+pd$week <- as.numeric(pd$date)
+pd$week[pd$week >= 53] <- pd$week[pd$week >= 53] -52
+pd$week <- pd$week-1
+pd$date <- daily$Date
+
+# ggplot(data=pd,aes(x=date,y=observed)) + 
+#   geom_line(col='red') + 
+#   geom_line(aes(y=fitted),col='blue') + 
+#   geom_line(aes(y=forecast)) +
+#   geom_ribbon(aes(ymin=lo95,ymax=hi95),alpha=.25) + 
+#   scale_x_date(name='',breaks='1 week',minor_breaks='1 day',labels=date_format("%d-%b-%y"),expand=c(0,0)) + 
+#   scale_y_continuous(name='Units of Y', breaks= seq(0,max(c(test$MinsWorked, train$total, df_tbats$`Hi 95`)),200)) + 
+#   labs(title = paste0("TBATS Fit to Simulated Data (MAD = ",
+#                          round(mad_custom(test$MinsWorked, df_tbats$`Point Forecast`), digits = 2),")"),
+#        subtitle = paste0("black=forecast, blue=fitted, red=data, shadow=95% conf. interval"))+
+#   theme(axis.text.x = element_text(angle = 45))
+ 
+ts_models[nrow(ts_models)+1,] <- NA
+ts_models$model[nrow(ts_models)] <- "TBATS"
+ts_models$MAD[nrow(ts_models)] <- round(mad_custom(test$HoursWorked, df_tbats$`Point Forecast`), digits = 2)
+ts_models$avg_forecast[nrow(ts_models)] <- round(mean(for_tbats$mean), digits = 2)
+ts_models$avg_lo80[nrow(ts_models)] <- mean(as.data.frame(for_tbats$lower)[,1])
+ts_models$avg_lo95[nrow(ts_models)] <- mean(as.data.frame(for_tbats$lower)[,2])
+ts_models$avg_hi80[nrow(ts_models)] <- mean(as.data.frame(for_tbats$upper)[,1])
+ts_models$avg_hi95[nrow(ts_models)] <- mean(as.data.frame(for_tbats$upper)[,2])
+
+```
+
+```{r, echo = FALSE}
+knitr::kable(ts_models)
+```
+
+Given that the Holt's Trend Method has the smallest MAD score, I'll choose that one to make forecasts for the next 2 weeks post the last date of the dataset. 
+
+```{r, echo = FALSE, include = FALSE}
+
+daily_ts <- ts(daily$HoursWorked, 
+              freq=7,
+              start=daily$Week[1])
+
+### Holt's Trend Method
+
+holt_model <- holt(daily_ts, h = 14)
+holt_sum <- summary(holt_model)
+pd <- funggcast(daily_ts, holt_model)
+
+pd$week <- as.numeric(pd$date)
+pd$week[pd$week >= 53] <- pd$week[pd$week >= 53] -52
+pd$week <- pd$week-1
+pd$date <- seq(daily$Date[1],daily$Date[1]+nrow(pd)-1,1)
+```
+
+```{r, echo = FALSE, warning= FALSE}
+ggplot(data=pd,aes(x=date,y=observed)) +
+  geom_line(col='red') +
+  geom_line(aes(y=fitted),col='blue') +
+  geom_line(aes(y=forecast)) +
+  geom_ribbon(aes(ymin=lo95,ymax=hi95),alpha=.25) +
+  scale_x_date(name='',breaks='1 week',minor_breaks='1 day',labels=date_format("%d-%b-%y"),expand=c(0,0)) +
+  scale_y_continuous(name='Hours of Work', breaks= seq(0,ceiling(as.numeric(max(c(daily$HoursWorked, pd$hi95), na.rm = T))),5)) +
+  labs(title = paste0("Holt's Trend Method Fit"),
+       subtitle = paste0("black=forecast, blue=fitted, red=data, shadow=95% conf. interval"))+
+  theme(axis.text.x = element_text(angle = 45))
+
+prediction <- pd[57:70,c("date", "forecast", "lo80", "hi80", "lo95", "hi95")] 
+prediction$forecast <- round(prediction$forecast, digits = 2)
+prediction$lo80 <- round(prediction$lo80, digits = 2)
+prediction$hi80 <- round(prediction$hi80, digits = 2)
+prediction$lo95 <- round(prediction$lo95, digits = 2)
+prediction$hi95 <- round(prediction$hi95, digits = 2)
+
+knitr::kable(prediction)
+
+```
+
+The model forecasts a decreasing trend, estimating that on average across the next 14 days, the daily hours worked will be ~9 hours, starting at 10 hours on average on May 27 and 28, and decreasing to 7.50 hours by June 9th. This model estimates that there is an 80% chance that the true hours worked per day in the following 2 weeks will not exceed 18.5 hours/day, and there is a 95% chance that the true hours worked per day in the following 2 weeks will not exceed 23 hours. Given that the confidence interval is fairly wide, it may be adviseable to plan for the forecasted number of hours per day, while having a number of volunteers on stand-by in case daily variation exceeds the expected workload. 
+
+
+## Days of the Week
 
 ### Volume by type of WFH? does that follow trends?
 
